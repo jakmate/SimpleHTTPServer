@@ -21,11 +21,16 @@ int main(int argc , char *argv[])
     struct sockaddr_in6 client_addr = {0};
 
     int recvbuflen = DEFAULT_BUFLEN;
-    char *sendbuf = "Client: sending data test";
+    char *sendbuf = "GET /index.html HTTP/1.1\r\n"
+                    "Host: www.example.com\r\n"
+                    "User-Agent: MySimpleClient/1.0\r\n"
+                    "Accept: text/html\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
     char recvbuf[DEFAULT_BUFLEN] = "";
 
     sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == 0) {
+    if (sock == INVALID_SOCKET) {
         printf("socket() failed: %d\n", WSAGetLastError());
         WSACleanup();
         return 1;
@@ -67,13 +72,27 @@ int main(int argc , char *argv[])
         return 1;
     }
 
-    result = recv(sock, recvbuf, recvbuflen, 0);
-    if ( result > 0 )
-        wprintf(L"Bytes received: %d\n", result);
-    else if ( result == 0 )
-        wprintf(L"Connection closed\n");
-    else
-        wprintf(L"recv failed with error: %d\n", WSAGetLastError());
+    char* buffer = (char*)malloc(4096);
+    int totalBytes = 0;
+
+    do {
+        result = recv(sock, recvbuf, recvbuflen - 1, 0);
+        if (result > 0) {
+            if (totalBytes + result < 4095) {
+                memcpy(buffer + totalBytes, recvbuf, result);
+                totalBytes += result;
+            }
+        }
+        else if (result == 0) {
+            printf("Connection closed\n");
+        }
+        else {
+            printf("recv failed with error: %d\n", WSAGetLastError());
+        }
+    } while (result > 0);
+
+    buffer[totalBytes] = '\0';
+    printf("Full response (%d bytes):\n%s\n", totalBytes, buffer);
 
     result = shutdown(sock, SD_RECEIVE);
     if (result == SOCKET_ERROR) {
@@ -90,6 +109,7 @@ int main(int argc , char *argv[])
         return 1;
     }
     
+    free(buffer);
     WSACleanup();
 	return 0;
 }
