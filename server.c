@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>  
+#include <sys/stat.h>
+#include <time.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -14,10 +16,60 @@ typedef struct {
   char *value;
 } header_t;
 
-header_t *headers = NULL;
-size_t header_count = 0, header_cap = 0;
+typedef struct {
+    int code;
+    const char* message;
+} status_entry_t;
 
-void* foo(void* arg) {
+// HTTP 1.0 status codes
+static const status_entry_t status_table[] = {
+    // 2xx Success
+    {200, "OK"},
+    {201, "Created"},
+    {202, "Accepted"},
+    {204, "No Content"},
+    
+    // 3xx Redirection
+    {300, "Multiple Choices"},
+    {301, "Moved Permanently"},
+    {302, "Moved Temporarily"},
+    {304, "Not Modified"},
+    
+    // 4xx Client Error
+    {400, "Bad Request"},
+    {401, "Unauthorized"},
+    {403, "Forbidden"},
+    {404, "Not Found"},
+    
+    // 5xx Server Error
+    {500, "Internal Server Error"},
+    {501, "Not Implemented"},
+    {502, "Bad Gateway"},
+    {503, "Service Unavailable"}
+};
+
+static const char* get_status_message(int code) {
+    for (int i = 0; i < sizeof(status_table)/sizeof(status_table[0]); i++) {
+        if (status_table[i].code == code) {
+            return status_table[i].message;
+        }
+    }
+    return "Unknown";
+}
+
+// Content-type header
+static const char* get_content_type(const char* filepath) {
+    const char* ext = strrchr(filepath, '.');
+    if (!ext || strcmp(ext, ".txt") == 0) return "text/plain";
+    if (strcmp(ext, ".html") == 0) return "text/html";
+    if (strcmp(ext, ".css") == 0) return "text/css";
+    if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(ext, ".png") == 0) return "image/png";
+    if (strcmp(ext, ".gif") == 0) return "image/gif";
+    return "application/octet-stream";
+}
+
+static void* handle_request(void* arg) {
     printf("Current thread ID: %lu\n", (unsigned long)pthread_self());
 
     SOCKET client = *((SOCKET*)arg);
@@ -49,21 +101,23 @@ void* foo(void* arg) {
         printf("Full message (%d bytes):\n%s\n", total, buffer);
     }
 
-    const char * method = strtok(buffer, " ");
-    char * path = strtok(NULL, " ");
+    header_t *headers = NULL;
+    size_t header_count = 0, header_cap = 0;
+    const char* method = strtok(buffer, " ");
+    char* path = strtok(NULL, " ");
     const char* filepath = path;
     if (filepath && filepath[0] == '/') {
         filepath++;
     }
-    const char * version = strtok(NULL, "\r\n");
+    const char* version = strtok(NULL, "\r\n");
     
-    char *line = strtok(NULL, "\r\n");
+    char* line = strtok(NULL, "\r\n");
     while (line && *line) {
-        char *colon = strchr(line, ':');
+        char* colon = strchr(line, ':');
         if (!colon) break;
         *colon = '\0';
-        char *name  = line;
-        char *value = colon + 1;
+        char* name  = line;
+        char* value = colon + 1;
         while (*value == ' ') value++;
 
         if (header_count == header_cap) {
@@ -85,15 +139,9 @@ void* foo(void* arg) {
         line = strtok(NULL, "\r\n");
     }
 
-    const char* status;
-    int code;
-    if (method && strcmp(method, "GET") == 0){
-        status = "OK";
-        code = 200;
-    }
-    else{
-        status = "Method Not Allowed";
-        code = 405;
+    int code = 200;
+    if (method && (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && strcmp(method, "POST") != 0)) {
+        code = 501;
     }
 
     FILE *fptr = NULL;
@@ -105,7 +153,6 @@ void* foo(void* arg) {
     int bodySize = 0;
 
     if (fptr == NULL){
-        status = "Not Found";
         code = 404;
         bodyBuffer = strdup("<html><body><h1>404 Not Found</h1><p>The requested file was not found.</p></body></html>");
         if (bodyBuffer) {
@@ -122,27 +169,54 @@ void* foo(void* arg) {
             if (bodyBuffer != NULL) {
                 fread(bodyBuffer, 1, bodySize, fptr);
                 bodyBuffer[bodySize] = '\0';
-                printf("%s", bodyBuffer);
+                //printf("%s", bodyBuffer);
             }
         }
         fclose(fptr);
     }
 
-    char headers_str[512];
-    int header_len = snprintf(headers_str, sizeof(headers_str), 
+    // Date Header
+    char* timeBuffer = (char*)malloc(sizeof(char) * 30);
+    time_t now = time(NULL);
+    struct tm* t = gmtime(&now);
+    strftime(timeBuffer, 30, "%a, %d %b %Y %H:%M:%S GMT", t);
+
+    // Modification Header
+    struct stat attr;
+    char *modificationBuffer = (char*)malloc(sizeof(char) * 30);
+    if (stat(filepath, &attr) == 0) {
+        struct tm *timeinfo = gmtime(&attr.st_mtime);
+        strftime(modificationBuffer, 30, "%a, %d %b %Y %H:%M:%S GMT", timeinfo);
+    } else {
+        perror("stat");
+    }
+
+    char* headers_str = malloc(sizeof(char) * BUFFER_SIZE);
+    int header_len = snprintf(headers_str, BUFFER_SIZE, 
         "%s %d %s\r\n"
+        "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
+        "Date: %s\r\n"
+        "Server: %s\r\n"
+        "Last-Modified: %s\r\n"
         "\r\n", 
-        version, code, status, bodySize);
+        version, code, get_status_message(code), get_content_type(filepath), bodySize, timeBuffer, "MyBadHTTPServer", modificationBuffer);
 
     if (send(client, headers_str, header_len, 0) == SOCKET_ERROR) {
         printf("send failed: %d\n", WSAGetLastError());
         WSACleanup();
     }
 
-    if (bodyBuffer != NULL && bodySize > 0) {
-        if (send(client, bodyBuffer, bodySize, 0) == SOCKET_ERROR) {
-            printf("send failed: %d\n", WSAGetLastError());
+    free(timeBuffer);
+    free(modificationBuffer);
+    free(headers_str);
+    free(headers);
+
+    if (method && strcmp(method, "HEAD") != 0){
+        if (bodyBuffer != NULL && bodySize > 0) {
+            if (send(client, bodyBuffer, bodySize, 0) == SOCKET_ERROR) {
+                printf("send failed: %d\n", WSAGetLastError());
+            }
         }
     }
 
@@ -218,7 +292,7 @@ int main(int argc , char *argv[])
         wprintf(L"Client connected.\n");
 
         pthread_t thread1;
-        pthread_create(&thread1, NULL, foo, (void*)client);
+        pthread_create(&thread1, NULL, handle_request, (void*)client);
         pthread_detach(thread1);
     }
 

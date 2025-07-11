@@ -21,11 +21,12 @@ int main(int argc , char *argv[])
     struct sockaddr_in6 client_addr = {0};
 
     int recvbuflen = DEFAULT_BUFLEN;
-    char *sendbuf = "GET /index.html HTTP/1.1\r\n"
+    char *sendbuf = "HEAD /index.html HTTP/1.0\r\n"
                     "Host: www.example.com\r\n"
                     "User-Agent: MySimpleClient/1.0\r\n"
-                    "Accept: text/html\r\n"
-                    "Connection: close\r\n"
+                    "Accept-encoding: text/html\r\n"
+                    "Authorization: haha\r\n"
+                    "If-Modified-Since: 01-01-0001 01:01:01\r\n"
                     "\r\n";
     char recvbuf[DEFAULT_BUFLEN] = "";
 
