@@ -1,5 +1,5 @@
 # code details
-EXES    := server client
+EXES    := server
 SRCS    := $(EXES:=.c)
 OBJS    := $(EXES:=.o) 
 
@@ -20,9 +20,6 @@ all: lint $(EXES)
 
 # link
 server: server.o
-	$(CC) $^ $(CLINK) -o $@
-
-client: client.o
 	$(CC) $^ $(CLINK) -o $@
 
 # Linting
