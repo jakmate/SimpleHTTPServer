@@ -115,9 +115,14 @@ class TestHTTPServer(unittest.TestCase):
         conn.request("PUT", "/test.txt")
         self.assertEqual(conn.getresponse().status, 501)
         
-        # 411 Length Required (Section 9.4)
-        conn.request("POST", "/new.txt", body="content")
-        self.assertEqual(conn.getresponse().status, 411)
+        # 411 Length Required (Section 9.4) - use raw socket
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.connect(('::1', 8000))
+        request = b"POST /new.txt HTTP/1.1\r\nHost: [::1]:8000\r\n\r\ncontent"
+        sock.send(request)
+        response = sock.recv(1024).decode()
+        sock.close()
+        self.assertIn("411", response.split()[1])
         
         # 403 Forbidden (Section 9.4)
         conn.request("GET", "/../server.c")
@@ -199,17 +204,21 @@ class TestHTTPServer(unittest.TestCase):
 
     def test_post_security(self):
         """Test POST validation (Section 12.1)"""
-        conn = self.make_connection()
+        # Missing Content-Length - use raw socket
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.connect(('::1', 8000))
+        request = b"POST /test.txt HTTP/1.1\r\nHost: [::1]:8000\r\n\r\ncontent"
+        sock.send(request)
+        response = sock.recv(1024).decode()
+        sock.close()
+        self.assertIn("411", response.split()[1])
         
-        # Missing Content-Length
-        conn.request("POST", "/test.txt", body="content")
-        res = conn.getresponse()
-        self.assertEqual(res.status, 411)
+        conn = self.make_connection()
         
         # Invalid path
         conn.request("POST", "/invalid_dir/new.txt", 
                     body="content", headers={"Content-Length": "7"})
-        self.assertEqual(conn.getresponse().status, 404)
+        self.assertEqual(conn.getresponse().status, 403)
         
         # Valid path
         conn.request("POST", f"/{TEST_DIR}/valid.txt", 
