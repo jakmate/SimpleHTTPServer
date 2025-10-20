@@ -14,6 +14,8 @@
 
 #define BUFFER_SIZE 8192
 #define MAX_HEADERS 50
+#define KEEPALIVE_TIMEOUT 15
+#define MAX_KEEPALIVE_REQUESTS 100
 
 typedef struct {
     char *name;
@@ -118,260 +120,319 @@ static void* handle_request(void* arg) {
     SOCKET client = *((SOCKET*)arg);
     free(arg);
 
-    char* buffer = malloc(BUFFER_SIZE);
-    if (!buffer) {
-        closesocket(client);
-        return NULL;
-    }
+    // Set socket timeout
+    DWORD timeout = KEEPALIVE_TIMEOUT * 1000;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 
-    // Read request
-    int total = 0;
-    while (total < BUFFER_SIZE - 1) {
-        int received = recv(client, buffer + total, BUFFER_SIZE - total - 1, 0);
-        if (received <= 0) break;
-        
-        total += received;
-        buffer[total] = '\0';
-        
-        if (strstr(buffer, "\r\n\r\n")) break;
-    }
+    int keep_alive = 1;
+    int request_count = 0;
 
-    if (total == 0) {
-        free(buffer);
-        closesocket(client);
-        return NULL;
-    }
+    while (keep_alive && request_count < MAX_KEEPALIVE_REQUESTS) {
+        request_count++;
 
-    // Parse request line
-    char* request_copy = strdup(buffer);
-    if (!request_copy) {
-        free(buffer);
-        closesocket(client);
-        return NULL;
-    }
-    
-    const char* method = strtok(request_copy, " ");
-    const char* uri = strtok(NULL, " ");
-    const char* version = strtok(NULL, "\r\n");
-    
-    int status_code = 200;
-    char* filepath = NULL;
-    
-    // Validate request
-    if (!version || (strcmp(version, "HTTP/1.0") != 0 && strcmp(version, "HTTP/1.1") != 0) || !method || !uri) {
-        status_code = 400;
-    } else if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && strcmp(method, "POST") != 0) {
-        status_code = 501;
-    }
-    
-    // Process URI
-    if (uri && status_code == 200) {
-        const char* path_start = (uri[0] == '/') ? uri + 1 : uri;
-        
-        char* decoded_path = malloc(strlen(path_start) + 1);
-        if (!decoded_path) {
-            status_code = 500;
-        } else {
-            url_decode(decoded_path, path_start);
-            
-            if (!is_safe_path(decoded_path)) {
-                status_code = 403;
-                free(decoded_path);
-                decoded_path = NULL;
-            } else if (strlen(decoded_path) == 0) {
-                free(decoded_path);
-                decoded_path = strdup("index.html");
-                if (!decoded_path) status_code = 500;
-            }
-            filepath = decoded_path;
-        }
-    }
-
-    // Parse headers
-    header_t headers[MAX_HEADERS];
-    int header_count = 0;
-    
-    char* line = strtok(NULL, "\r\n");
-    while (line && *line && header_count < MAX_HEADERS) {
-        char* colon = strchr(line, ':');
-        if (!colon) break;
-        
-        *colon = '\0';
-        const char* value = colon + 1;
-        while (*value == ' ' || *value == '\t') value++;
-        
-        headers[header_count].name = strdup(line);
-        headers[header_count].value = strdup(value);
-        if (!headers[header_count].name || !headers[header_count].value) {
-            free(headers[header_count].name);
-            free(headers[header_count].value);
+        char* buffer = malloc(BUFFER_SIZE);
+        if (!buffer) {
             break;
         }
-        header_count++;
-        line = strtok(NULL, "\r\n");
-    }
 
-    // Handle POST requests
-    char* request_body = NULL;
-    int content_length = -1;
-    int is_post = method && strcmp(method, "POST") == 0;
-    
-    if (is_post && status_code == 200) {
-        // Find Content-Length
-        for (int i = 0; i < header_count; i++) {
-            if (strcasecmp(headers[i].name, "Content-Length") == 0) {
-                content_length = atoi(headers[i].value);
+        // Read request
+        int total = 0;
+        while (total < BUFFER_SIZE - 1) {
+            int received = recv(client, buffer + total, BUFFER_SIZE - total - 1, 0);
+            if (received <= 0) {
+                keep_alive = 0;
                 break;
             }
-        }
-
-        if (content_length < 0) {
-            status_code = 411;
-        } else if (content_length == 0) {
-            request_body = malloc(1);
-            if (request_body) request_body[0] = '\0';
-            else status_code = 500;
-        } else {
-            // Read request body
-            char* body_start = strstr(buffer, "\r\n\r\n");
-            if (body_start) body_start += 4;
-            int body_already_read = body_start ? (buffer + total) - body_start : 0;
             
-            request_body = malloc(content_length + 1);
-            if (!request_body) {
+            total += received;
+            buffer[total] = '\0';
+            
+            if (strstr(buffer, "\r\n\r\n")) break;
+        }
+
+        if (total == 0) {
+            free(buffer);
+            break;
+        }
+
+        // Parse request line
+        char* request_copy = strdup(buffer);
+        if (!request_copy) {
+            free(buffer);
+            break;
+        }
+        
+        const char* method = strtok(request_copy, " ");
+        const char* uri = strtok(NULL, " ");
+        const char* version = strtok(NULL, "\r\n");
+        
+        int status_code = 200;
+        char* filepath = NULL;
+        int is_http11 = version && strcmp(version, "HTTP/1.1") == 0;
+        
+        // HTTP/1.1 defaults to keep-alive, HTTP/1.0 defaults to close
+        int client_wants_keepalive = is_http11;
+        
+        // Validate request
+        if (!version || (strcmp(version, "HTTP/1.0") != 0 && strcmp(version, "HTTP/1.1") != 0) || !method || !uri) {
+            status_code = 400;
+            keep_alive = 0;
+        } else if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && strcmp(method, "POST") != 0) {
+            status_code = 501;
+        }
+        
+        // Process URI
+        if (uri && status_code == 200) {
+            const char* path_start = (uri[0] == '/') ? uri + 1 : uri;
+            
+            char* decoded_path = malloc(strlen(path_start) + 1);
+            if (!decoded_path) {
                 status_code = 500;
+                keep_alive = 0;
             } else {
-                if (body_already_read > 0) {
-                    int copy_size = (body_already_read > content_length) ? content_length : body_already_read;
-                    memcpy(request_body, body_start, copy_size);
-                }
+                url_decode(decoded_path, path_start);
                 
-                int remaining = content_length - body_already_read;
-                while (remaining > 0) {
-                    int bytes_read = recv(client, request_body + (content_length - remaining), remaining, 0);
-                    if (bytes_read <= 0) break;
-                    remaining -= bytes_read;
+                if (!is_safe_path(decoded_path)) {
+                    status_code = 403;
+                    free(decoded_path);
+                    decoded_path = NULL;
+                } else if (strlen(decoded_path) == 0) {
+                    free(decoded_path);
+                    decoded_path = strdup("index.html");
+                    if (!decoded_path) {
+                        status_code = 500;
+                        keep_alive = 0;
+                    }
                 }
-                request_body[content_length] = '\0';
+                filepath = decoded_path;
             }
         }
-    }
 
-    // Handle file operations
-    char* response_body = NULL;
-    int response_body_size = 0;
-    struct stat file_stat;
-    int has_file_stat = 0;
-
-    if (status_code == 200) {
-        if (is_post && content_length >= 0) {
-            // POST: Create/write file
-            FILE* fptr = fopen(filepath, "wb");
-            if (fptr && (content_length == 0 || request_body)) {
-                if (content_length > 0) {
-                    fwrite(request_body, 1, content_length, fptr);
-                }
-                fclose(fptr);
-                status_code = 201;
-                response_body = strdup("<html><body><h1>Resource Created</h1></body></html>");
-                if (response_body) response_body_size = strlen(response_body);
-                else status_code = 500;
-            } else {
-                if (fptr) fclose(fptr);
-                status_code = 403;
+        // Parse headers
+        header_t headers[MAX_HEADERS];
+        int header_count = 0;
+        
+        char* line = strtok(NULL, "\r\n");
+        while (line && *line && header_count < MAX_HEADERS) {
+            char* colon = strchr(line, ':');
+            if (!colon) break;
+            
+            *colon = '\0';
+            const char* value = colon + 1;
+            while (*value == ' ' || *value == '\t') value++;
+            
+            headers[header_count].name = strdup(line);
+            headers[header_count].value = strdup(value);
+            if (!headers[header_count].name || !headers[header_count].value) {
+                free(headers[header_count].name);
+                free(headers[header_count].value);
+                break;
             }
-        } else if (method && (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0)) {
-            // GET/HEAD: Read file
-            if (filepath && stat(filepath, &file_stat) == 0) {
-                has_file_stat = 1;
-                FILE* fptr = fopen(filepath, "rb");
-                if (fptr) {
-                    fseek(fptr, 0L, SEEK_END);
-                    response_body_size = ftell(fptr);
-                    fseek(fptr, 0L, SEEK_SET);
+            
+            // Check Connection header
+            if (strcasecmp(headers[header_count].name, "Connection") == 0) {
+                if (strcasecmp(headers[header_count].value, "close") == 0) {
+                    client_wants_keepalive = 0;
+                } else if (strcasecmp(headers[header_count].value, "keep-alive") == 0) {
+                    client_wants_keepalive = 1;
+                }
+            }
+            
+            header_count++;
+            line = strtok(NULL, "\r\n");
+        }
+
+        // Update keep_alive based on client request
+        if (!client_wants_keepalive) {
+            keep_alive = 0;
+        }
+
+        // Handle POST requests
+        char* request_body = NULL;
+        int content_length = -1;
+        int is_post = method && strcmp(method, "POST") == 0;
+        
+        if (is_post && status_code == 200) {
+            // Find Content-Length
+            for (int i = 0; i < header_count; i++) {
+                if (strcasecmp(headers[i].name, "Content-Length") == 0) {
+                    content_length = atoi(headers[i].value);
+                    break;
+                }
+            }
+
+            if (content_length < 0) {
+                status_code = 411;
+                keep_alive = 0;
+            } else if (content_length == 0) {
+                request_body = malloc(1);
+                if (request_body) request_body[0] = '\0';
+                else {
+                    status_code = 500;
+                    keep_alive = 0;
+                }
+            } else {
+                // Read request body
+                char* body_start = strstr(buffer, "\r\n\r\n");
+                if (body_start) body_start += 4;
+                int body_already_read = body_start ? (buffer + total) - body_start : 0;
+                
+                request_body = malloc(content_length + 1);
+                if (!request_body) {
+                    status_code = 500;
+                    keep_alive = 0;
+                } else {
+                    if (body_already_read > 0) {
+                        int copy_size = (body_already_read > content_length) ? content_length : body_already_read;
+                        memcpy(request_body, body_start, copy_size);
+                    }
                     
-                    if (strcmp(method, "GET") == 0 && response_body_size > 0) {
-                        response_body = malloc(response_body_size + 1);
-                        if (response_body) {
-                            fread(response_body, 1, response_body_size, fptr);
-                            response_body[response_body_size] = '\0';
+                    int remaining = content_length - body_already_read;
+                    while (remaining > 0) {
+                        int bytes_read = recv(client, request_body + (content_length - remaining), remaining, 0);
+                        if (bytes_read <= 0) {
+                            keep_alive = 0;
+                            break;
                         }
+                        remaining -= bytes_read;
+                    }
+                    request_body[content_length] = '\0';
+                }
+            }
+        }
+
+        // Handle file operations
+        char* response_body = NULL;
+        int response_body_size = 0;
+        struct stat file_stat;
+        int has_file_stat = 0;
+
+        if (status_code == 200) {
+            if (is_post && content_length >= 0) {
+                // POST: Create/write file
+                FILE* fptr = fopen(filepath, "wb");
+                if (fptr && (content_length == 0 || request_body)) {
+                    if (content_length > 0) {
+                        fwrite(request_body, 1, content_length, fptr);
                     }
                     fclose(fptr);
+                    status_code = 201;
+                    response_body = strdup("<html><body><h1>Resource Created</h1></body></html>");
+                    if (response_body) response_body_size = strlen(response_body);
+                    else {
+                        status_code = 500;
+                        keep_alive = 0;
+                    }
+                } else {
+                    if (fptr) fclose(fptr);
+                    status_code = 403;
+                }
+            } else if (method && (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0)) {
+                // GET/HEAD: Read file
+                if (filepath && stat(filepath, &file_stat) == 0) {
+                    has_file_stat = 1;
+                    FILE* fptr = fopen(filepath, "rb");
+                    if (fptr) {
+                        fseek(fptr, 0L, SEEK_END);
+                        response_body_size = ftell(fptr);
+                        fseek(fptr, 0L, SEEK_SET);
+                        
+                        if (strcmp(method, "GET") == 0 && response_body_size > 0) {
+                            response_body = malloc(response_body_size + 1);
+                            if (response_body) {
+                                fread(response_body, 1, response_body_size, fptr);
+                                response_body[response_body_size] = '\0';
+                            }
+                        }
+                        fclose(fptr);
+                    } else {
+                        status_code = 404;
+                    }
                 } else {
                     status_code = 404;
                 }
-            } else {
-                status_code = 404;
             }
         }
+
+        // Generate error pages if needed
+        if (status_code >= 400 && !response_body) {
+            char error_msg[256];
+            snprintf(error_msg, sizeof(error_msg), 
+                "<html><body><h1>%d %s</h1></body></html>", 
+                status_code, get_status_message(status_code));
+            response_body = strdup(error_msg);
+            if (response_body) response_body_size = strlen(response_body);
+        }
+
+        // Generate response headers
+        char date_header[64];
+        time_t now = time(NULL);
+        strftime(date_header, sizeof(date_header), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&now));
+
+        const char* content_type = (status_code >= 400 || status_code == 201) ? "text/html" : get_content_type(filepath);
+
+        char* response_headers = malloc(BUFFER_SIZE);
+        if (response_headers) {
+            int len = snprintf(response_headers, BUFFER_SIZE,
+                "%s %d %s\r\n"
+                "Date: %s\r\n"
+                "Server: MyBadHTTPServer\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: %s\r\n",
+                version ? version : "HTTP/1.0", status_code, get_status_message(status_code),
+                date_header, content_type, response_body_size,
+                keep_alive ? "keep-alive" : "close");
+
+            // Add Keep-Alive parameters
+            if (keep_alive) {
+                len += snprintf(response_headers + len, BUFFER_SIZE - len, 
+                    "Keep-Alive: timeout=%d, max=%d\r\n", 
+                    KEEPALIVE_TIMEOUT, MAX_KEEPALIVE_REQUESTS - request_count);
+            }
+
+            // Add Last-Modified if we have file stats
+            if (has_file_stat) {
+                char last_modified[64];
+                strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&file_stat.st_mtime));
+                len += snprintf(response_headers + len, BUFFER_SIZE - len, "Last-Modified: %s\r\n", last_modified);
+            }
+
+            // Add Location header for 201 Created
+            if (status_code == 201 && filepath) {
+                snprintf(response_headers + len, BUFFER_SIZE - len, "Location: /%s\r\n", filepath);
+            }
+
+            // Add final CRLF safely
+            int current_len = strlen(response_headers);
+            if (current_len < BUFFER_SIZE - 3) {
+                strncpy(response_headers + current_len, "\r\n", BUFFER_SIZE - current_len - 1);
+                response_headers[BUFFER_SIZE - 1] = '\0';
+            }
+
+            // Send response
+            int sent = send(client, response_headers, strlen(response_headers), 0);
+            if (sent <= 0) keep_alive = 0;
+            
+            if (method && strcmp(method, "HEAD") != 0 && response_body && response_body_size > 0) {
+                sent = send(client, response_body, response_body_size, 0);
+                if (sent <= 0) keep_alive = 0;
+            }
+        } else {
+            keep_alive = 0;
+        }
+
+        // Cleanup for this request
+        cleanup_headers(headers, header_count);
+        free(request_copy);
+        free(response_headers);
+        free(response_body);
+        free(request_body);
+        free(filepath);
+        free(buffer);
     }
 
-    // Generate error pages if needed
-    if (status_code >= 400 && !response_body) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-            "<html><body><h1>%d %s</h1></body></html>", 
-            status_code, get_status_message(status_code));
-        response_body = strdup(error_msg);
-        if (response_body) response_body_size = strlen(response_body);
-    }
-
-    // Generate response headers
-    char date_header[64];
-    time_t now = time(NULL);
-    strftime(date_header, sizeof(date_header), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&now));
-
-    const char* content_type = (status_code >= 400 || status_code == 201) ? "text/html" : get_content_type(filepath);
-
-    char* response_headers = malloc(BUFFER_SIZE);
-    if (response_headers) {
-        int len = snprintf(response_headers, BUFFER_SIZE,
-            "%s %d %s\r\n"
-            "Date: %s\r\n"
-            "Server: MyBadHTTPServer\r\n"
-            "Content-Type: %s\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: close\r\n",
-            version ? version : "HTTP/1.0", status_code, get_status_message(status_code),
-            date_header, content_type, response_body_size);
-
-        // Add Last-Modified if we have file stats
-        if (has_file_stat) {
-            char last_modified[64];
-            strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&file_stat.st_mtime));
-            len += snprintf(response_headers + len, BUFFER_SIZE - len, "Last-Modified: %s\r\n", last_modified);
-        }
-
-        // Add Location header for 201 Created
-        if (status_code == 201 && filepath) {
-            snprintf(response_headers + len, BUFFER_SIZE - len, "Location: /%s\r\n", filepath);
-        }
-
-        // Add final CRLF safely
-        int current_len = strlen(response_headers);
-        if (current_len < BUFFER_SIZE - 3) {
-            strncpy(response_headers + current_len, "\r\n", BUFFER_SIZE - current_len - 1);
-            response_headers[BUFFER_SIZE - 1] = '\0';
-        }
-
-        // Send response
-        send(client, response_headers, strlen(response_headers), 0);
-        if (method && strcmp(method, "HEAD") != 0 && response_body && response_body_size > 0) {
-            send(client, response_body, response_body_size, 0);
-        }
-    }
-
-    // Cleanup
-    cleanup_headers(headers, header_count);
-    free(request_copy);
-    free(response_headers);
-    free(response_body);
-    free(request_body);
-    free(filepath);
-    free(buffer);
     closesocket(client);
-
     return NULL;
 }
 

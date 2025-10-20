@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+#
+#  Tests based on https://www.w3.org/Protocols/HTTP/1.0/spec.html
+#
+
 import os
-import sys
 import time
 import http.client
 import unittest
 import socket
-import threading
 
 # Server configuration
 SERVER_HOST = "::1" if socket.has_ipv6 else "localhost"
